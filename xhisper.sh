@@ -51,6 +51,8 @@ for arg in "$@"; do
   esac
 done
 
+XDOTOOL='/usr/bin/xdotool'
+
 # Set binary paths based on local mode
 if [ "$LOCAL_MODE" -eq 1 ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,6 +66,16 @@ fi
 RECORDING="/tmp/xhisper.wav"
 LOGFILE="/tmp/xhisper.log"
 PROCESS_PATTERN="pw-record.*$RECORDING"
+
+# Get GROQ_API_KEY from environment, or read it from ~/.groq-api-key if not set
+: "${GROQ_API_KEY:=$(cat "$HOME/.groq-api-key" 2>/dev/null)}"
+
+# Optional: Throw an error (also to logfile) if no GROQ key found
+if [ -z "$GROQ_API_KEY" ]; then
+    echo "Error: GROQ_API_KEY env var is not set and ~/.groq-api-key file is missing or empty." >> $LOGFILE
+    echo "Error: GROQ_API_KEY env var is not set and ~/.groq-api-key file is missing or empty." >&2
+    exit 1
+fi
 
 # Default configuration
 long_recording_threshold=1000
@@ -119,16 +131,33 @@ if ! command -v "$XHISPERTOOL" &> /dev/null; then
 fi
 
 # Detect clipboard tool
-if command -v wl-copy &> /dev/null; then
-    CLIP_COPY="wl-copy"
-    CLIP_PASTE="wl-paste"
-elif command -v xclip &> /dev/null; then
+#if command -v wl-copy &> /dev/null; then
+#    CLIP_COPY="wl-copy"
+#    CLIP_PASTE="wl-paste"
+#elif command -v xclip &> /dev/null; then
+## dstellar - wl-copy is broken because I'm not on wayland
+if command -v xclip &> /dev/null; then
     CLIP_COPY() { xclip -selection clipboard; }
     CLIP_PASTE() { xclip -o -selection clipboard; }
 else
     echo "Error: No clipboard tool found. Install wl-clipboard or xclip." >&2
     exit 1
 fi
+# dstellar
+clip_copy() {
+    local window_class="$1"
+    shift
+    local text="$*"
+
+    if [ "$window_class" = "XTerm" ]; then
+        # Send to PRIMARY selection for xterm
+        echo -n "$text" | /usr/bin/xclip -selection primary
+    else
+        # Default to standard CLIPBOARD selection for everything else
+        echo -n "$text" | /usr/bin/xclip -selection clipboard
+    fi
+}
+#CLIP_PASTE="/usr/bin/xclip -o -selection clipboard"
 
 press_wrap_key() {
   if [ -n "$WRAP_KEY" ]; then
@@ -136,9 +165,42 @@ press_wrap_key() {
   fi
 }
 
+## This is faster than xhispertool and can actually paste newlines
 paste() {
+  # 1. get the text
+  local text="$1"
+
+  # Detect active window name/class
+  local winClass=$(/usr/bin/xprop -id $($XDOTOOL getactivewindow) WM_CLASS | awk -F '"' '{print $4}')
+
+  # 2. Push the text to the clipboard buffer and force xclip to stay active in the background
+  # (We use -selection clipboard to target Ctrl+V channels)
+  #echo -n "$text" | $CLIP_COPY
+  clip_copy $winClass $text
+
+  # 3. CRUCIAL: Give the X11 server a tiny window to register xclip's data ownership
+  if [[ "$text" != "(recording...)" ]]; then
+    sleep 0.25
+  fi
+
+  # 4. Trigger your terminal's paste shortcut based on window type
+  if [ "$winClass" = "XTerm" ]; then
+    # If it's xterm, paste is Shift+Insert
+    $XDOTOOL key shift+Insert
+  elif echo "$winClass" | grep -iq "terminal"; then
+    # Default behavior for other terminals is ctrl-shift-v
+    $XDOTOOL key Ctrl+Shift+v
+  else
+    # Default behavior for other applications
+    $XDOTOOL key ctrl+v
+  fi
+
+}
+
+oldpaste() {
   local text="$1"
   press_wrap_key
+
   # Type character by character
   # Use xhispertool type for ASCII (32-126), clipboard+paste for Unicode
   for ((i=0; i<${#text}; i++)); do
@@ -239,7 +301,13 @@ if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
   fi
 
   paste "(transcribing...)"
-  TRANSCRIPTION=$(transcribe "$RECORDING")
+  ## dstellar - added ~/.config/xhisper/processor support
+  if [[ -x ~/.config/xhisper/processor ]]; then
+    TRANSCRIPTION=$(transcribe "$RECORDING" | ~/.config/xhisper/processor)
+  else
+    TRANSCRIPTION=$(transcribe "$RECORDING")
+  fi
+
   delete_n_chars 17 # "(transcribing...)"
 
   paste "$TRANSCRIPTION"
