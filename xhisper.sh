@@ -86,6 +86,8 @@ non_ascii_initial_delay=0.1
 non_ascii_default_delay=0.025
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/xhisper/xhisperrc"
+# An executable script that can process text we get back from STT
+CONFIG_PROCESSOR="${XDG_CONFIG_HOME:-$HOME/.config}/xhisper/processor"
 
 if [ -f "$CONFIG_FILE" ]; then
   while IFS=: read -r key value || [ -n "$key" ]; do
@@ -130,34 +132,38 @@ if ! command -v "$XHISPERTOOL" &> /dev/null; then
     exit 1
 fi
 
-# Detect clipboard tool
-#if command -v wl-copy &> /dev/null; then
-#    CLIP_COPY="wl-copy"
-#    CLIP_PASTE="wl-paste"
-#elif command -v xclip &> /dev/null; then
-## dstellar - wl-copy is broken because I'm not on wayland
-if command -v xclip &> /dev/null; then
-    CLIP_COPY() { xclip -selection clipboard; }
-    CLIP_PASTE() { xclip -o -selection clipboard; }
+# Detect clipboard tool: use wl-copy only when running under Wayland, else xclip
+if command -v wl-copy &> /dev/null && { [ "$XDG_SESSION_TYPE" = "wayland" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+    CLIP_TOOL="wl-copy"
+elif command -v xclip &> /dev/null; then
+    CLIP_TOOL="xclip"
 else
-    echo "Error: No clipboard tool found. Install wl-clipboard or xclip." >&2
+    echo "Error: No working clipboard tool found. Install wl-clipboard or xclip." >&2
     exit 1
 fi
-# dstellar
+
+# Copy text to the clipboard (or PRIMARY selection for xterm) using the detected tool
 clip_copy() {
     local window_class="$1"
     shift
     local text="$*"
 
-    if [ "$window_class" = "XTerm" ]; then
-        # Send to PRIMARY selection for xterm
-        echo -n "$text" | /usr/bin/xclip -selection primary
+    if [ "$CLIP_TOOL" = "wl-copy" ]; then
+        if [ "$window_class" = "XTerm" ]; then
+            echo -n "$text" | wl-copy --primary
+        else
+            echo -n "$text" | wl-copy
+        fi
     else
-        # Default to standard CLIPBOARD selection for everything else
-        echo -n "$text" | /usr/bin/xclip -selection clipboard
+        if [ "$window_class" = "XTerm" ]; then
+            # Send to PRIMARY selection for xterm
+            echo -n "$text" | xclip -selection primary
+        else
+            # Default to standard CLIPBOARD selection for everything else
+            echo -n "$text" | xclip -selection clipboard
+        fi
     fi
 }
-#CLIP_PASTE="/usr/bin/xclip -o -selection clipboard"
 
 press_wrap_key() {
   if [ -n "$WRAP_KEY" ]; then
@@ -175,7 +181,6 @@ paste() {
 
   # 2. Push the text to the clipboard buffer and force xclip to stay active in the background
   # (We use -selection clipboard to target Ctrl+V channels)
-  #echo -n "$text" | $CLIP_COPY
   clip_copy $winClass $text
 
   # 3. CRUCIAL: Give the X11 server a tiny window to register xclip's data ownership
@@ -195,30 +200,6 @@ paste() {
     $XDOTOOL key ctrl+v
   fi
 
-}
-
-oldpaste() {
-  local text="$1"
-  press_wrap_key
-
-  # Type character by character
-  # Use xhispertool type for ASCII (32-126), clipboard+paste for Unicode
-  for ((i=0; i<${#text}; i++)); do
-    local char="${text:$i:1}"
-    local ascii=$(printf '%d' "'$char")
-
-    if [[ $ascii -ge 32 && $ascii -le 126 ]]; then
-      # ASCII printable character - use direct key typing (faster)
-      "$XHISPERTOOL" type "$char"
-    else
-      # Unicode or special character - use clipboard
-      echo -n "$char" | $CLIP_COPY
-      "$XHISPERTOOL" paste
-      # On first character (more error-prone), sleep longer
-      [ "$i" -eq 0 ] && sleep "$non_ascii_initial_delay" || sleep "$non_ascii_default_delay"
-    fi
-  done
-  press_wrap_key
 }
 
 delete_n_chars() {
@@ -301,9 +282,10 @@ if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
   fi
 
   paste "(transcribing...)"
-  ## dstellar - added ~/.config/xhisper/processor support
-  if [[ -x ~/.config/xhisper/processor ]]; then
-    TRANSCRIPTION=$(transcribe "$RECORDING" | ~/.config/xhisper/processor)
+
+	# If we have a 'processor' available then pipe it through that
+  if [[ -x $CONFIG_PROCESSOR ]]; then
+		TRANSCRIPTION=$(transcribe "$RECORDING" | $CONFIG_PROCESSOR)
   else
     TRANSCRIPTION=$(transcribe "$RECORDING")
   fi
